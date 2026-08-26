@@ -38,6 +38,29 @@ lazy_static::lazy_static! {
 }
 
 fn initialize(app_dir: &str, custom_client_config: &str) {
+    // Fork default: if PATCHED_FORK_SERVER_CONFIG was baked in at build time, pre-configure this
+    // build's server from it, unless the user already set their own — each field below is only
+    // applied when the corresponding option is still empty, so a user's own Settings -> ID/Relay
+    // Server entry (or an imported config string) always wins, exactly as it would over RustDesk
+    // Inc.'s own defaults.
+    if let Some(cfg) = option_env!("PATCHED_FORK_SERVER_CONFIG") {
+        if !cfg.is_empty() {
+            if let Ok(server) = crate::custom_server::get_custom_server_from_string(cfg) {
+                if !server.host.is_empty() {
+                    *config::PROD_RENDEZVOUS_SERVER.write().unwrap() = server.host;
+                }
+                if !server.key.is_empty() && get_option("key").is_empty() {
+                    set_option("key".to_owned(), server.key);
+                }
+                if !server.api.is_empty() && get_option("api-server").is_empty() {
+                    set_option("api-server".to_owned(), server.api);
+                }
+                if !server.relay.is_empty() && get_option("relay-server").is_empty() {
+                    set_option("relay-server".to_owned(), server.relay);
+                }
+            }
+        }
+    }
     flutter::async_tasks::start_flutter_async_runner();
     // `APP_DIR` is set in `main_get_data_dir_ios()` on iOS.
     #[cfg(not(target_os = "ios"))]

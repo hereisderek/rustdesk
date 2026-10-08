@@ -658,12 +658,6 @@ jobs:
           mkdir -p ./flutter/android/app/src/main/jniLibs/arm64-v8a
           cp ./target/aarch64-linux-android/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
 
-      - name: Upload Rustdesk library to Artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: librustdesk.so.aarch64-linux-android
-          path: ./target/aarch64-linux-android/release/liblibrustdesk.so
-
       - name: Build rustdesk
         shell: bash
         env:
@@ -708,6 +702,13 @@ jobs:
         with:
           name: rustdesk-${{ env.VERSION }}-aarch64.apk
           path: ${{steps.sign-rustdesk.outputs.signedReleaseFile}}
+
+      - name: Upload unsigned apk to Artifacts
+        if: env.ANDROID_SIGNING_KEY == null && env.UPLOAD_ARTIFACT == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rustdesk-${{ env.VERSION }}-aarch64.apk
+          path: signed-apk/rustdesk-${{ env.VERSION }}-aarch64.apk
 
       - name: Publish signed apk package
         if: env.ANDROID_SIGNING_KEY != null && env.UPLOAD_ARTIFACT == 'true' && env.PUBLISH_RELEASE == 'true'

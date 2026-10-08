@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: patched-fork-bot <patched-fork-bot@users.noreply.github.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] secure_tcp: no-op, self-hosted rendezvous servers never
+ answer this handshake
+
+secure_tcp() waits for the rendezvous/relay server to participate in a
+key-exchange handshake that is only implemented server-side in RustDesk's
+paid Server Pro product. Third-party self-hosted stacks (e.g.
+lejianwen/rustdesk-server + lejianwen/rustdesk-api) never respond to it, so
+every call site that reaches secure_tcp() (peer connections gated on
+`key && (token || switch_code)`, plus the unconditional health-check and
+rendezvous-mediator connections) hangs until READ_TIMEOUT and fails with
+"Failed to secure tcp: deadline has elapsed: Please try later".
+
+Connections without this handshake are already encrypted (see the
+use_ws()/key-exchange path in secure_tcp_impl), so skipping it here is safe.
+
+See: https://github.com/lejianwen/rustdesk-api/issues/92
+     https://github.com/rustdesk/rustdesk/issues/13466
+     https://github.com/rustdesk/rustdesk/commit/22eb19faa2693c4745777e99d2b1a2c87ddf1ca9
+
+Upstream context drifts release to release — if this fails to apply, find
+`pub async fn secure_tcp` in src/common.rs and re-diff by hand; do not skip.
+---
+ src/common.rs | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/common.rs b/src/common.rs
+index 0000000..0000000 100644
+--- a/src/common.rs
++++ b/src/common.rs
+@@ -2043,5 +2043,6 @@
+ }
+ 
+ pub async fn secure_tcp(conn: &mut Stream, key: &str) -> ResultType<()> {
++    return Ok(());
+     secure_tcp_impl(conn, key, true).await
+ }
+--
+2.43.0

@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: patched-fork-bot <patched-fork-bot@users.noreply.github.com>
+Date: Mon, 1 Jan 2024 00:00:00 +0000
+Subject: [PATCH] flutter_ffi: pre-configure a server from the
+ PATCHED_FORK_SERVER_CONFIG build-time secret, if set
+
+Bakes in a "server config string" (the same format Settings -> ID/Relay
+Server's Import/QR-code flow already accepts: reverse + base64 + JSON
+{host,key,api,relay}, optionally signature-wrapped) as this build's default
+server, without ever putting the actual host/key/api in this patch file or
+this repo's history. The string itself lives only in the
+PATCHED_FORK_SERVER_CONFIG GitHub Actions secret (see
+flutter-build-patched.yml, which exports it as an env var so option_env!
+below can see it at compile time) and, at runtime, in the user's own local
+Config once set.
+
+Decoding reuses get_custom_server_from_string() (src/custom_server.rs) — the
+same parser the exe-filename/QR/clipboard-import paths already use — instead
+of hand-rolling the format here.
+
+initialize() (src/flutter_ffi.rs) is called from Dart at process start on
+every platform this fork builds (Windows/macOS/Android are all Flutter
+builds); it's the one place common to all three.
+
+If PATCHED_FORK_SERVER_CONFIG is unset (empty), this is a no-op and the
+build behaves exactly like a stock, unconfigured RustDesk client.
+
+If this fails to apply, initialize() moved/changed upstream — re-diff by
+hand against src/flutter_ffi.rs.
+---
+ src/flutter_ffi.rs | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/src/flutter_ffi.rs b/src/flutter_ffi.rs
+index 0000000..0000000 100644
+--- a/src/flutter_ffi.rs
++++ b/src/flutter_ffi.rs
+@@ -35,6 +35,29 @@ lazy_static::lazy_static! {
+ }
+ 
+ fn initialize(app_dir: &str, custom_client_config: &str) {
++    // Fork default: if PATCHED_FORK_SERVER_CONFIG was baked in at build time, pre-configure this
++    // build's server from it, unless the user already set their own — each field below is only
++    // applied when the corresponding option is still empty, so a user's own Settings -> ID/Relay
++    // Server entry (or an imported config string) always wins, exactly as it would over RustDesk
++    // Inc.'s own defaults.
++    if let Some(cfg) = option_env!("PATCHED_FORK_SERVER_CONFIG") {
++        if !cfg.is_empty() {
++            if let Ok(server) = crate::custom_server::get_custom_server_from_string(cfg) {
++                if !server.host.is_empty() {
++                    *config::PROD_RENDEZVOUS_SERVER.write().unwrap() = server.host;
++                }
++                if !server.key.is_empty() && get_option("key").is_empty() {
++                    set_option("key".to_owned(), server.key);
++                }
++                if !server.api.is_empty() && get_option("api-server").is_empty() {
++                    set_option("api-server".to_owned(), server.api);
++                }
++                if !server.relay.is_empty() && get_option("relay-server").is_empty() {
++                    set_option("relay-server".to_owned(), server.relay);
++                }
++            }
++        }
++    }
+     flutter::async_tasks::start_flutter_async_runner();
+     // `APP_DIR` is set in `main_get_data_dir_ios()` on iOS.
+     #[cfg(not(target_os = "ios"))]
+--
+2.43.0

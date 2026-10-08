@@ -1,0 +1,230 @@
+name: Sync upstream, patch, and release (patched fork)
+
+# Keeps this fork's `patched` branch and releases in sync with rustdesk/rustdesk, carrying this
+# fork's local patches (patches/*.patch, applied in order with `git am` — see
+# CLIENT_FORK_TASK_PROMPT.md for the original secure_tcp patch).
+#
+# Triggers:
+#   - schedule:          daily check for a new upstream release; no-ops if already built.
+#   - workflow_dispatch:  manual run (optionally pin an upstream tag); builds but never publishes
+#                          a GitHub Release, so ad-hoc runs can't accidentally ship one.
+#   - push a "<version>-patched" tag: forces a (re)build of that exact upstream version and
+#     force-updates the tag to the fresh build. Note: pushes made with the default GITHUB_TOKEN
+#     (i.e. the `tag` job below) do not themselves trigger this event, so this can't self-loop.
+#
+# `patched` is rebuilt from scratch on top of the upstream tag every run (not a long-lived branch
+# with merge commits), per the task doc.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream rustdesk/rustdesk tag to sync to (blank = latest release)"
+        required: false
+        type: string
+  push:
+    tags:
+      - "*-patched"
+
+permissions:
+  contents: write
+
+# `patched` is built from upstream's full tree, which includes .github/workflows/*. Pushing that
+# is a "workflow file update" as far as GitHub is concerned, and GITHUB_TOKEN can NEVER do that —
+# not even with `permissions: workflows: write` (that's a PAT/GitHub App scope, not a valid
+# GITHUB_TOKEN grant; setting it here previously broke this file's schema validation entirely).
+# The only way around it is a real PAT with the `workflow` scope, wired in as PATCHED_FORK_PAT
+# below and used for every git push that can touch the tree (sync-and-patch, tag).
+
+concurrency:
+  group: patched-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: rustdesk/rustdesk
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_tag: ${{ steps.resolve.outputs.upstream_tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      patched_tag: ${{ steps.resolve.outputs.patched_tag }}
+      should_run: ${{ steps.resolve.outputs.should_run }}
+      is_manual: ${{ steps.resolve.outputs.is_manual }}
+    steps:
+      - name: Resolve upstream tag and decide whether to run
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_UPSTREAM_TAG: ${{ github.event.inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+
+          is_manual=false
+          if [ "$EVENT_NAME" = "push" ]; then
+            # Triggered by a manually-pushed "<version>-patched" tag: (re)build that exact version.
+            upstream_tag="${REF_NAME%-patched}"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "${INPUT_UPSTREAM_TAG:-}" ]; then
+            upstream_tag="$INPUT_UPSTREAM_TAG"
+            is_manual=true
+          else
+            upstream_tag="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name)"
+            if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              is_manual=true
+            fi
+          fi
+
+          if [ -z "$upstream_tag" ]; then
+            echo "::error::Could not resolve an upstream tag to build"
+            exit 1
+          fi
+
+          version="${upstream_tag#v}"
+          patched_tag="${version}-patched"
+
+          already_built=false
+          if gh api "repos/${{ github.repository }}/git/ref/tags/${patched_tag}" >/dev/null 2>&1; then
+            already_built=true
+          fi
+
+          should_run=true
+          if [ "$EVENT_NAME" = "schedule" ] && [ "$already_built" = "true" ]; then
+            should_run=false
+          fi
+
+          {
+            echo "upstream_tag=$upstream_tag"
+            echo "version=$version"
+            echo "patched_tag=$patched_tag"
+            echo "should_run=$should_run"
+            echo "is_manual=$is_manual"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Plan"
+            echo "- event: $EVENT_NAME"
+            echo "- upstream tag: $upstream_tag"
+            echo "- patched tag: $patched_tag"
+            echo "- already built: $already_built"
+            echo "- will run: $should_run"
+            echo "- publish release: $([ "$is_manual" = "true" ] && echo false || echo true)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  sync-and-patch:
+    needs: plan
+    if: needs.plan.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      patched_sha: ${{ steps.push.outputs.sha }}
+    steps:
+      - name: Checkout fork (master, for patches/)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: master
+          token: ${{ secrets.PATCHED_FORK_PAT }}
+          persist-credentials: true
+
+      - name: Preserve patches outside the tree
+        shell: bash
+        run: |
+          shopt -s nullglob
+          mkdir -p /tmp/patches-main
+          for p in patches/*.patch; do cp "$p" /tmp/patches-main/; done
+
+      - name: Rebuild the patched branch on top of the upstream tag
+        env:
+          UPSTREAM_TAG: ${{ needs.plan.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "patched-fork-bot"
+          git config user.email "patched-fork-bot@users.noreply.github.com"
+          git remote add upstream "https://github.com/${{ env.UPSTREAM_REPO }}.git"
+          git fetch --depth=1 upstream "refs/tags/${UPSTREAM_TAG}:refs/tags/upstream-${UPSTREAM_TAG}"
+          git checkout -B patched "refs/tags/upstream-${UPSTREAM_TAG}"
+          git submodule update --init --recursive
+
+      - name: Apply local patches (main tree)
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          patches=(/tmp/patches-main/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "No patches/*.patch to apply"
+            exit 0
+          fi
+          git config user.name "patched-fork-bot"
+          git config user.email "patched-fork-bot@users.noreply.github.com"
+          for p in "${patches[@]}"; do
+            if ! git apply --check "$p" 2>/tmp/apply.err; then
+              echo "::error::$(basename "$p") no longer applies cleanly to ${{ needs.plan.outputs.upstream_tag }}. Re-diff it by hand against the current source and update the patch file on master. Refusing to ship an unpatched build."
+              cat /tmp/apply.err
+              exit 1
+            fi
+            git apply "$p"
+            subject="$(sed -n 's/^Subject: \[PATCH\] //p' "$p" | head -1)"
+            git commit -am "${subject:-$(basename "$p")}"
+          done
+
+      - name: Push patched branch
+        id: push
+        run: |
+          set -euo pipefail
+          git push --force origin patched
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: [plan, sync-and-patch]
+    if: needs.plan.outputs.should_run == 'true'
+    uses: ./.github/workflows/flutter-build-patched.yml
+    secrets: inherit
+    with:
+      checkout-ref: ${{ needs.sync-and-patch.outputs.patched_sha }}
+      version: ${{ needs.plan.outputs.version }}
+      upload-artifact: true
+      publish-release: ${{ needs.plan.outputs.is_manual != 'true' }}
+      upload-tag: ${{ needs.plan.outputs.patched_tag }}
+
+  tag:
+    needs: [plan, sync-and-patch, build]
+    if: needs.plan.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout patched commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.sync-and-patch.outputs.patched_sha }}
+          persist-credentials: true
+          # Deliberately the default GITHUB_TOKEN here, not PATCHED_FORK_PAT: this only points a
+          # tag at a commit that sync-and-patch already pushed (no new workflow-file content), and
+          # GITHUB_TOKEN pushes don't retrigger Actions — a PAT push here would self-trigger this
+          # same workflow via the "push: tags: *-patched" filter above and loop forever.
+
+      - name: Tag the patched build if not already tagged
+        env:
+          TAG: ${{ needs.plan.outputs.patched_tag }}
+          UPSTREAM_TAG: ${{ needs.plan.outputs.upstream_tag }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          git config user.name "patched-fork-bot"
+          git config user.email "patched-fork-bot@users.noreply.github.com"
+
+          exists=false
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            exists=true
+          fi
+
+          if [ "$exists" = "true" ] && [ "$EVENT_NAME" != "push" ]; then
+            echo "Tag ${TAG} already exists, leaving it as-is"
+          else
+            # On a "push" trigger (a human re-pushing "<version>-patched"), force-update the tag
+            # to point at this fresh rebuild rather than whatever commit they originally tagged.
+            git tag -f -a "${TAG}" -m "Patched build of upstream ${UPSTREAM_TAG} (see patches/*.patch)"
+            git push --force origin "${TAG}"
+          fi

@@ -1,14 +1,13 @@
 name: Build patched fork artifacts only (no sync, no tag, no release)
 
 # Manual force-build of the existing patched tree using the same build jobs as patched-release.yml.
-# Builds whatever `ref` points at (default: the `patched` branch left by the last patched-release
-# run) and uploads artifacts to the workflow run only.
+# Builds whatever `ref` points at (default: the `<version>-patched` tag made by patched-release.yml) and uploads artifacts to the workflow run only.
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Branch, tag or SHA to build (blank = patched branch)"
+        description: "Branch, tag or SHA to build (blank = <version>-patched tag)"
         required: false
         type: string
       version:
@@ -34,12 +33,12 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          ref="${INPUT_REF:-patched}"
           version="${INPUT_VERSION:-}"
           if [ -z "$version" ]; then
             version="$(gh api repos/rustdesk/rustdesk/releases/latest --jq .tag_name)"
             version="${version#v}"
           fi
+          ref="${INPUT_REF:-${version}-patched}"
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Building ref=$ref version=$version" >> "$GITHUB_STEP_SUMMARY"

@@ -228,3 +228,17 @@ jobs:
             git tag -f -a "${TAG}" -m "Patched build of upstream ${UPSTREAM_TAG} (see patches/*.patch)"
             git push --force origin "${TAG}"
           fi
+
+  # The built commit stays reachable through the <version>-patched tag, and artifacts/releases are
+  # unaffected, so the temporary `patched` branch is not needed once the build and tag succeed.
+  # It is kept on failure so the tree can be inspected.
+  cleanup:
+    needs: [plan, tag]
+    if: needs.plan.outputs.should_run == 'true' && needs.tag.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete the patched branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/patched" || echo "patched branch already gone"
